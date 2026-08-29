@@ -79,6 +79,7 @@ export {
 	getFileTypeByExtension,
 	isFileTypeSupported
 } from './file-type';
+export { getOfficeDocumentFormat, isOfficeDocument } from './office-documents';
 
 // Formatting utilities
 export {

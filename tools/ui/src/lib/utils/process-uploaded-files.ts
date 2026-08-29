@@ -1,4 +1,5 @@
 import { heicFileToJpegDataURL, isHeicMimeType } from './heic-to-jpeg';
+import { extractOfficeDocumentText, isOfficeDocument } from './office-documents';
 import { convertPDFToText } from './pdf-processing';
 import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
 import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
@@ -68,7 +69,18 @@ export async function processFilesToChatUploaded(
 		};
 
 		try {
-			if (getFileTypeCategory(file.type) === FileTypeCategory.IMAGE) {
+			if (isOfficeDocument(file.name, file.type)) {
+				try {
+					const textContent = await extractOfficeDocumentText(file);
+
+					results.push({ ...base, textContent });
+				} catch (error) {
+					console.error(`Failed to parse Office document ${file.name}:`, error);
+					const loadError = `Failed to parse "${file.name}". The file may be unsupported, encrypted, or corrupted.`;
+
+					toast.error(loadError);
+				}
+			} else if (getFileTypeCategory(file.type) === FileTypeCategory.IMAGE) {
 				let preview = await readFileAsDataURL(file);
 
 				// Normalize SVG and WebP to PNG, and HEIC to compressed JPEG, in previews

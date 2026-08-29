@@ -1,3 +1,4 @@
+import { isOfficeDocument } from './office-documents';
 import { convertPDFToImage, convertPDFToText } from './pdf-processing';
 import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
 import { isLikelyTextFile, readFileAsText } from './text-files';
@@ -46,6 +47,21 @@ export async function parseFilesToMessageExtras(
 				size: file.size,
 				type: AttachmentType.MCP_PROMPT
 			});
+
+			continue;
+		}
+
+		if (isOfficeDocument(file.name, file.type)) {
+			if (file.textContent?.trim()) {
+				extras.push({
+					content: file.textContent,
+					name: file.name,
+					size: file.size,
+					type: AttachmentType.TEXT
+				});
+			} else {
+				console.error(`Office document ${file.name} has no extracted text`);
+			}
 
 			continue;
 		}

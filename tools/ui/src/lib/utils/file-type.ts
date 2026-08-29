@@ -1,3 +1,4 @@
+import { isOfficeDocument } from './office-documents';
 import {
 	AUDIO_FILE_TYPES,
 	IMAGE_FILE_TYPES,
@@ -221,6 +222,8 @@ export function getFileTypeByExtension(filename: string): string | null {
 }
 
 export function isFileTypeSupported(filename: string, mimeType?: string): boolean {
+	if (isOfficeDocument(filename, mimeType)) return true;
+
 	// Images are detected and handled separately for vision models
 	if (mimeType) {
 		const category = getFileTypeCategory(mimeType);
