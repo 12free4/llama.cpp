@@ -35,6 +35,7 @@ Llama UI supports two server operation modes:
 
 - **Images** - JPEG, PNG, GIF, WebP, SVG (with PNG conversion)
 - **Documents** - PDF (text extraction or image conversion for vision models)
+- **Office documents** - Word, PowerPoint, Excel, OpenDocument, and RTF files are parsed locally with AnyDoc WASM. The original binary is not sent to a parsing service; extracted Markdown is added as text context. Spreadsheet presentation formatting may not be preserved, and embedded images or charts are not interpreted as visual input.
 - **Audio** - MP3, WAV for audio-capable models
 - **Text files** - Source code, markdown, and other text formats
 - **Drag-and-drop** and paste support with rich previews
