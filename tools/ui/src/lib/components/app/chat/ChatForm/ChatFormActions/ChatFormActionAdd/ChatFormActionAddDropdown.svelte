@@ -1,6 +1,10 @@
 <script lang="ts">
 	import { File, Image, MessageSquare, Mic, Plus, Video } from '@lucide/svelte';
-	import { ChatFormActionAddToolsSubmenu, McpLogo } from '$lib/components/app';
+	import {
+		ChatFormActionAddReasoningSubmenu,
+		ChatFormActionAddToolsSubmenu,
+		McpLogo
+	} from '$lib/components/app';
 	import { buttonVariants } from '$lib/components/ui/button';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import * as Tooltip from '$lib/components/ui/tooltip';
@@ -132,6 +136,8 @@
 			</DropdownMenu.Item>
 
 			<ChatFormActionAddToolsSubmenu />
+
+			<ChatFormActionAddReasoningSubmenu />
 
 			<DropdownMenu.Item
 				class="flex cursor-pointer items-center gap-2"
