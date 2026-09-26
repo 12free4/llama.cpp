@@ -11,6 +11,43 @@
 #include <string>
 #include <vector>
 
+constexpr double NMSE_THRESHOLD = 1e-5;
+
+// normalized mean squared error = mse(a, b) / mse(a, 0)
+static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
+    GGML_ASSERT(a.size() == b.size());
+    double mse_a_b = 0.0;
+    double mse_a_0 = 0.0;
+
+    for (size_t i = 0; i < a.size(); i++) {
+        const float a_i = a[i];
+        const float b_i = b[i];
+
+        mse_a_b += (double) (a_i - b_i) * (a_i - b_i);
+        mse_a_0 += (double) a_i * a_i;
+    }
+
+    return mse_a_b / mse_a_0;
+}
+
+struct generation_result {
+    llama_tokens tokens;
+    std::vector<std::vector<float>> logits;
+
+    bool empty() const { return tokens.empty(); }
+};
+
+static bool get_current_logits(llama_context * ctx, std::vector<float> & out) {
+    const auto * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const float * logits = llama_get_logits_ith(ctx, -1);
+    if (logits == nullptr) {
+        return false;
+    }
+    out.assign(logits, logits + n_vocab);
+    return true;
+}
+
 struct llama_batch_ptr {
     llama_batch batch;
 
@@ -28,15 +65,22 @@ struct llama_batch_ptr {
     const llama_batch & get() const { return batch; }
 };
 
-static llama_tokens generate_tokens(llama_context * ctx, llama_sampler * smpl, int & n_past, int32_t n_predict, llama_seq_id seq_id) {
-    llama_tokens result;
+static generation_result generate_tokens(llama_context * ctx, llama_sampler * smpl, int & n_past, int32_t n_predict, llama_seq_id seq_id) {
+    generation_result result;
     llama_batch_ptr batch(1, 0, 1);
 
     for (int i = 0; i < n_predict; i++) {
+        std::vector<float> logits;
+        if (!get_current_logits(ctx, logits)) {
+            LOG_ERR("\n%s: failed to get logits\n", __func__);
+            return {};
+        }
+
         auto next_token = llama_sampler_sample(smpl, ctx, -1);
 
         LOG("%d ", next_token);
-        result.push_back(next_token);
+        result.tokens.push_back(next_token);
+        result.logits.push_back(std::move(logits));
 
         common_batch_clear(batch.get());
         common_batch_add(batch.get(), next_token, n_past, {seq_id}, true);
@@ -51,12 +95,61 @@ static llama_tokens generate_tokens(llama_context * ctx, llama_sampler * smpl, i
     return result;
 }
 
+static bool generate_tokens_compare(
+        llama_context * ctx, llama_sampler * smpl, int & n_past, int32_t n_predict, llama_seq_id seq_id,
+        const generation_result & expected) {
+    if (expected.tokens.size() != expected.logits.size() || expected.tokens.size() < (size_t) n_predict) {
+        LOG_ERR("\n%s: invalid expected generation\n", __func__);
+        return false;
+    }
+
+    llama_batch_ptr batch(1, 0, 1);
+
+    for (int i = 0; i < n_predict; i++) {
+        std::vector<float> logits;
+        if (!get_current_logits(ctx, logits)) {
+            LOG_ERR("\n%s: failed to get logits\n", __func__);
+            return false;
+        }
+        if (logits.size() != expected.logits[i].size()) {
+            LOG_ERR("\n%s: logits size mismatch at step %d: %zu != %zu\n", __func__, i, logits.size(), expected.logits[i].size());
+            return false;
+        }
+
+        const double nmse_val = nmse(expected.logits[i], logits);
+        LOG_TRC("%s: step %d nmse = %.6e\n", __func__, i, nmse_val);
+        if (nmse_val > NMSE_THRESHOLD) {
+            LOG_ERR("\n%s: error: NMSE at step %d is %.6e (threshold %.1e)\n", __func__, i, nmse_val, NMSE_THRESHOLD);
+            return false;
+        }
+
+        const auto next_token = llama_sampler_sample(smpl, ctx, -1);
+        const auto expected_token = expected.tokens[i];
+
+        LOG("%d ", next_token);
+        if (next_token != expected_token) {
+            LOG_TRC("%s: sampled token %d differs from expected %d, using expected token\n", __func__, next_token, expected_token);
+        }
+
+        common_batch_clear(batch.get());
+        common_batch_add(batch.get(), expected_token, n_past, {seq_id}, true);
+
+        if (llama_decode(ctx, batch.get())) {
+            LOG_ERR("\n%s: failed to evaluate\n", __func__);
+            return false;
+        }
+        n_past++;
+    }
+
+    return true;
+}
+
 // Test 1: baseline
 // - decode all but the last token
 // - save state to disk
 // - decode the last token
 // - generate n_predict tokens
-static llama_tokens test_baseline(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+static generation_result test_baseline(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
@@ -109,7 +202,7 @@ static bool test_seq_rm_isolated(
     for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
         llama_batch_ptr batch(n_tokens, 0, 1);
         for (size_t i = 0; i < n_tokens; ++i) {
-            common_batch_add(batch.get(), tokens[i], i, { seq_id }, false);
+            common_batch_add(batch.get(), tokens[i], i, { seq_id }, i == n_tokens - 1);
         }
 
         if (llama_decode(ctx.get(), batch.get())) {
@@ -166,7 +259,7 @@ static bool test_seq_rm_isolated(
 // - load state from file
 // - replay the last prompt token
 // - generate n_predict tokens and compare against expected result
-static bool test_state_load(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
+static bool test_state_load(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const generation_result & expected_result) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
@@ -195,14 +288,8 @@ static bool test_state_load(struct llama_model * model, const struct common_para
     }
     n_past++;
 
-    // Generate tokens
-    auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 0);
-    if (result.empty()) {
-        return false;
-    }
-
-    if (result != expected_result) {
-        LOG_ERR("\n%s: error: generation differs from expected\n", __func__);
+    // Generate tokens and compare logits against the baseline
+    if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, params.n_predict, 0, expected_result)) {
         return false;
     }
 
@@ -217,7 +304,7 @@ static bool test_state_load(struct llama_model * model, const struct common_para
 // - replay the last prompt token
 // - migrate KV cache from seq 0 to seq 1 via the CPU path
 // - generate n_predict tokens on seq 1 and compare against expected result
-static bool test_seq_cp_host(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
+static bool test_seq_cp_host(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const generation_result & expected_result) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
@@ -267,14 +354,8 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
         LOG_TRC("%s: seq 1 restored, %zd bytes\n", __func__, nset);
     }
 
-    // Generate tokens on seq 1
-    auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 1);
-    if (result.empty()) {
-        return false;
-    }
-
-    if (result != expected_result) {
-        LOG_ERR("\n%s: error: generation differs from expected\n", __func__);
+    // Generate tokens and compare logits against the baseline
+    if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, params.n_predict, 1, expected_result)) {
         return false;
     }
 
@@ -289,7 +370,7 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
 // - replay the last prompt token
 // - migrate KV cache from seq 0 to seq 1 via the on-device path
 // - generate n_predict tokens on seq 1 and compare against expected result
-static bool test_seq_cp_device(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
+static bool test_seq_cp_device(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const generation_result & expected_result) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
@@ -339,14 +420,8 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
         LOG_TRC("%s: seq 1 restored, %zd bytes\n", __func__, nset);
     }
 
-    // Generate tokens on seq 1
-    auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 1);
-    if (result.empty()) {
-        return false;
-    }
-
-    if (result != expected_result) {
-        LOG_ERR("\n%s: error: generation differs from expected\n", __func__);
+    // Generate tokens and compare logits against the baseline
+    if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, params.n_predict, 1, expected_result)) {
         return false;
     }
 
@@ -355,7 +430,160 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 }
 
 
-// Run the full save/load test suite (tests 1-5) for a single model.
+// Test 6/7: seq copy (scatter)
+// - decode the same prefix on two sequences, interleaving seq 0 cells between the seq 1 cells
+// - save the seq 1 state, free the interleaved seq 0 cells, and restore via the given io path
+// - the restore destination is non-contiguous: scatter reads are batched per contiguous run
+// - save again on the host and compare the two blobs byte for byte
+static bool test_seq_cp_scatter(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, int test_num, bool on_device) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_ctx      = 256;
+    params_ctx.n_seq_max  = 2;
+    params_ctx.kv_unified = true;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+
+    LOG("\n=== Test %d: seq copy (%s, scatter) ===\n", test_num, on_device ? "device" : "host");
+
+    const uint32_t flags = on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
+
+    auto decode_one = [&](llama_token tok, int pos, llama_seq_id seq) {
+        llama_batch_ptr batch(1, 0, 1);
+        common_batch_add(batch.get(), tok, pos, { seq }, true);
+        return llama_decode(ctx.get(), batch.get()) == 0;
+    };
+
+    // seq 0 cells 0,1,4 interleave the seq 1 cells 2,3,5
+    if (!decode_one(tokens[0], 0, 0) ||
+        !decode_one(tokens[1], 1, 0) ||
+        !decode_one(tokens[0], 0, 1) ||
+        !decode_one(tokens[1], 1, 1) ||
+        !decode_one(tokens[2], 2, 0) ||
+        !decode_one(tokens[2], 2, 1)) {
+        LOG_ERR("%s: failed to build interleaved state\n", __func__);
+        return false;
+    }
+
+    const auto get_seq_state = [&](llama_seq_id seq_id, uint32_t fl, std::vector<uint8_t> & state) {
+        const size_t state_size = llama_state_seq_get_size_ext(ctx.get(), seq_id, fl);
+        if (state_size == 0) {
+            LOG_ERR("%s: sequence state is empty\n", __func__);
+            return false;
+        }
+
+        state.resize(state_size);
+        const size_t ncopy = llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), seq_id, fl);
+        if (ncopy != state.size()) {
+            LOG_ERR("%s: sequence state length %zu does not match expected length %zu\n",
+                    __func__, ncopy, state.size());
+            return false;
+        }
+
+        return true;
+    };
+
+    // host blob: contains the KV data, used for the byte-for-byte comparison
+    std::vector<uint8_t> state_before;
+    if (!get_seq_state(1, LLAMA_STATE_SEQ_FLAGS_NONE, state_before)) {
+        return false;
+    }
+
+    // save via the io path under test
+    std::vector<uint8_t> state_save;
+    if (!get_seq_state(1, flags, state_save)) {
+        return false;
+    }
+    LOG_TRC("%s: seq 1 saved via %s, %zu bytes\n", __func__, on_device ? "device" : "host", state_save.size());
+
+    // free seq 0's cells so the ring is fragmented: the restore destination (seq 1's interleaved cells) stays non-contiguous
+    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
+        LOG_ERR("%s: failed to remove sequence 0\n", __func__);
+        return false;
+    }
+
+    // restore via the io path under test
+    const size_t nset = llama_state_seq_set_data_ext(ctx.get(), state_save.data(), state_save.size(), 1, flags);
+    if (nset != state_save.size()) {
+        LOG_ERR("%s: seq set data length %zu does not match expected length %zu\n", __func__, nset, state_save.size());
+        return false;
+    }
+    LOG_TRC("%s: seq 1 restored via %s, %zu bytes\n", __func__, on_device ? "device" : "host", nset);
+
+    std::vector<uint8_t> state_after;
+    if (!get_seq_state(1, LLAMA_STATE_SEQ_FLAGS_NONE, state_after)) {
+        return false;
+    }
+
+    // the blob is serialized in sequence cell order, so identical bytes iff the restore wrote the same KV
+    if (state_before.size() != state_after.size() || memcmp(state_before.data(), state_after.data(), state_before.size()) != 0) {
+        LOG_ERR("\n%s: error: restored KV state is not byte-identical to the saved state\n", __func__);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
+// Test 8: state blob round-trip
+// compares blobs rather than generated text: a partially restored cell still decodes to plausible tokens
+static bool test_state_roundtrip(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+
+    LOG("\n=== Test 8: state blob round-trip ===\n");
+
+    if (llama_decode(ctx.get(), llama_batch_get_one(const_cast<llama_token *>(tokens.data()), (int32_t) tokens.size()))) {
+        LOG_ERR("\n%s: failed to decode prompt\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob_a(llama_state_seq_get_size(ctx.get(), 0));
+    const size_t n_a = llama_state_seq_get_data(ctx.get(), blob_a.data(), blob_a.size(), 0);
+    if (n_a != blob_a.size()) {
+        LOG_ERR("\n%s: saved %zu bytes, expected %zu\n", __func__, n_a, blob_a.size());
+        return false;
+    }
+
+    if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
+        LOG_ERR("\n%s: failed to erase seq 0\n", __func__);
+        return false;
+    }
+
+    if (llama_state_seq_set_data(ctx.get(), blob_a.data(), blob_a.size(), 0) != blob_a.size()) {
+        LOG_ERR("\n%s: failed to restore seq 0\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> blob_b(llama_state_seq_get_size(ctx.get(), 0));
+    const size_t n_b = llama_state_seq_get_data(ctx.get(), blob_b.data(), blob_b.size(), 0);
+    if (n_b != n_a) {
+        LOG_ERR("\n%s: re-saved %zu bytes, expected %zu\n", __func__, n_b, n_a);
+        return false;
+    }
+
+    size_t n_diff = 0;
+    size_t i_diff = 0;
+    for (size_t i = 0; i < n_a; i++) {
+        if (blob_a[i] != blob_b[i]) {
+            if (n_diff == 0) {
+                i_diff = i;
+            }
+            n_diff++;
+        }
+    }
+
+    if (n_diff > 0) {
+        LOG_ERR("\n%s: state changed across a restore: %zu of %zu bytes differ, first at offset %zu\n",
+                __func__, n_diff, n_a, i_diff);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
+// Run the full save/load test suite (tests 1-8) for a single model.
 // Returns true if all tests pass, false otherwise.
 static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     struct common_params params = base_params;
@@ -419,6 +647,21 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+        return false;
+    }
+
+    // Test 6: seq copy (host, scatter)
+    if (!test_seq_cp_scatter(model, params, tokens, 6, false)) {
+        return false;
+    }
+
+    // Test 7: seq copy (device, scatter)
+    if (!test_seq_cp_scatter(model, params, tokens, 7, true)) {
+        return false;
+    }
+
+    // Test 8: state blob round-trip
+    if (!test_state_roundtrip(model, params, tokens)) {
         return false;
     }
 
