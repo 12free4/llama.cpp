@@ -145,8 +145,6 @@
 
 			<ChatFormActionAddToolsSubmenu />
 
-			<ChatFormActionAddReasoningSubmenu />
-
 			<DropdownMenu.Item
 				class="flex cursor-pointer items-center gap-2"
 				onclick={chatFormActions.onMcpSettingsClick}
